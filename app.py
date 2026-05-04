@@ -192,6 +192,3 @@ def format_movie(movie, title):
         f"{reason}\n\n"
         f"資料來源：TMDb"
     )
-
-if __name__ == "__main__":
-    app.run(port=5000)
