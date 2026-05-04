@@ -13,7 +13,9 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
 
-
+if text in ["說明", "功能", "help", "Help", "HELP"]:
+    return get_help_text()
+    
 app = Flask(__name__)
 
 configuration = Configuration(
