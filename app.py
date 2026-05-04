@@ -1,7 +1,6 @@
 from flask import Flask, request, abort
 import os
 import requests
-import random
 
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.messaging import (
@@ -13,6 +12,7 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
+
 
 app = Flask(__name__)
 
@@ -26,6 +26,7 @@ handler = WebhookHandler(
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
+
 GENRE_MAP = {
     "喜劇": 35,
     "恐怖": 27,
@@ -36,9 +37,15 @@ GENRE_MAP = {
     "科幻": 878
 }
 
+
+# 用來記住每個使用者目前推薦到哪裡
+user_sessions = {}
+
+
 @app.route("/", methods=["GET"])
 def home():
     return "Movie LINE Bot is running."
+
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -52,10 +59,13 @@ def callback():
 
     return "OK"
 
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_text = event.message.text.strip()
-    reply_text = handle_user_text(user_text)
+    user_id = event.source.user_id
+
+    reply_text = handle_user_text(user_text, user_id)
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -66,7 +76,8 @@ def handle_message(event):
             )
         )
 
-def handle_user_text(text):
+
+def handle_user_text(text, user_id):
     if text == "說明":
         return (
             "我是「今晚看什麼」LINE Bot！🎬\n\n"
@@ -79,17 +90,23 @@ def handle_user_text(text):
             "6. 推薦動作\n"
             "7. 推薦懸疑\n"
             "8. 推薦科幻\n"
-            "9. 查電影 電影名稱\n\n"
+            "9. 查電影 電影名稱\n"
+            "10. 換一批\n\n"
             "例如：查電影 你的名字\n\n"
+            "每次會推薦 5 部電影。\n"
+            "如果沒有喜歡的，可以輸入「換一批」。\n\n"
             "資料來源：TMDb"
         )
 
     if text == "熱門電影":
-        return get_popular_movie()
+        return get_popular_movie(user_id, reset=True)
+
+    if text in ["換一批", "繼續推薦", "再推薦"]:
+        return recommend_next_batch(user_id)
 
     if text.startswith("推薦"):
         genre = text.replace("推薦", "").strip()
-        return recommend_by_genre(genre)
+        return recommend_by_genre(genre, user_id, reset=True)
 
     if text.startswith("查電影 "):
         keyword = text.replace("查電影 ", "", 1).strip()
@@ -97,46 +114,148 @@ def handle_user_text(text):
 
     return "我看不懂這個指令，可以輸入「說明」查看功能。"
 
-def get_popular_movie():
-    url = "https://api.themoviedb.org/3/movie/popular"
-    params = {
-        "api_key": TMDB_API_KEY,
-        "language": "zh-TW",
-        "page": 1
-    }
 
-    response = requests.get(url, params=params)
-    data = response.json()
+def get_popular_movie(user_id, reset=False):
+    movies = fetch_popular_movies()
 
-    movies = data.get("results", [])
-    if not movies:
-        return "目前找不到熱門電影資料。"
+    if reset or user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "mode": "popular",
+            "genre": None,
+            "shown_ids": set()
+        }
 
-    movie = random.choice(movies[:10])
-    return format_movie(movie, "熱門電影推薦")
+    return select_movies_without_repeat(
+        user_id=user_id,
+        movies=movies,
+        title="熱門電影推薦"
+    )
 
-def recommend_by_genre(genre):
+
+def recommend_by_genre(genre, user_id, reset=False):
     if genre not in GENRE_MAP:
         return "目前支援的類型有：喜劇、恐怖、愛情、動畫、動作、懸疑、科幻。"
 
-    url = "https://api.themoviedb.org/3/discover/movie"
-    params = {
-        "api_key": TMDB_API_KEY,
-        "language": "zh-TW",
-        "with_genres": GENRE_MAP[genre],
-        "sort_by": "popularity.desc",
-        "page": 1
-    }
+    movies = fetch_movies_by_genre(genre)
 
-    response = requests.get(url, params=params)
-    data = response.json()
+    if reset or user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "mode": "genre",
+            "genre": genre,
+            "shown_ids": set()
+        }
 
-    movies = data.get("results", [])
-    if not movies:
-        return f"目前找不到{genre}電影。"
+    return select_movies_without_repeat(
+        user_id=user_id,
+        movies=movies,
+        title=f"{genre}電影推薦"
+    )
 
-    movie = random.choice(movies[:10])
-    return format_movie(movie, f"{genre}電影推薦")
+
+def recommend_next_batch(user_id):
+    if user_id not in user_sessions:
+        return (
+            "你還沒有選擇推薦類型喔！\n"
+            "可以先輸入：熱門電影、推薦喜劇、推薦恐怖、推薦愛情、推薦動畫。"
+        )
+
+    session = user_sessions[user_id]
+
+    if session["mode"] == "popular":
+        movies = fetch_popular_movies()
+        return select_movies_without_repeat(
+            user_id=user_id,
+            movies=movies,
+            title="熱門電影推薦"
+        )
+
+    if session["mode"] == "genre":
+        genre = session["genre"]
+        movies = fetch_movies_by_genre(genre)
+        return select_movies_without_repeat(
+            user_id=user_id,
+            movies=movies,
+            title=f"{genre}電影推薦"
+        )
+
+    return "目前沒有可以繼續推薦的紀錄，請先輸入：熱門電影 或 推薦喜劇。"
+
+
+def fetch_popular_movies():
+    all_movies = []
+
+    for page in range(1, 4):
+        url = "https://api.themoviedb.org/3/movie/popular"
+        params = {
+            "api_key": TMDB_API_KEY,
+            "language": "zh-TW",
+            "page": page
+        }
+
+        response = requests.get(url, params=params)
+        data = response.json()
+        all_movies.extend(data.get("results", []))
+
+    return filter_valid_movies(all_movies)
+
+
+def fetch_movies_by_genre(genre):
+    all_movies = []
+
+    for page in range(1, 4):
+        url = "https://api.themoviedb.org/3/discover/movie"
+        params = {
+            "api_key": TMDB_API_KEY,
+            "language": "zh-TW",
+            "with_genres": GENRE_MAP[genre],
+            "sort_by": "popularity.desc",
+            "page": page
+        }
+
+        response = requests.get(url, params=params)
+        data = response.json()
+        all_movies.extend(data.get("results", []))
+
+    return filter_valid_movies(all_movies)
+
+
+def filter_valid_movies(movies):
+    valid_movies = []
+
+    for movie in movies:
+        title = movie.get("title")
+        overview = movie.get("overview")
+        movie_id = movie.get("id")
+
+        # 過濾掉沒有片名、沒有簡介、沒有 ID 的電影
+        if title and overview and movie_id:
+            valid_movies.append(movie)
+
+    return valid_movies
+
+
+def select_movies_without_repeat(user_id, movies, title):
+    shown_ids = user_sessions[user_id]["shown_ids"]
+
+    available_movies = [
+        movie for movie in movies
+        if movie.get("id") not in shown_ids
+    ]
+
+    if not available_movies:
+        user_sessions[user_id]["shown_ids"] = set()
+        return (
+            "這個類型目前沒有更多不重複的推薦了。\n"
+            "我已經幫你重新整理片單，可以再輸入一次「換一批」。"
+        )
+
+    selected_movies = available_movies[:5]
+
+    for movie in selected_movies:
+        shown_ids.add(movie.get("id"))
+
+    return format_movie_list(selected_movies, title)
+
 
 def search_movie(keyword):
     if not keyword:
@@ -154,25 +273,39 @@ def search_movie(keyword):
     data = response.json()
 
     movies = data.get("results", [])
+    movies = filter_valid_movies(movies)
+
     if not movies:
         return "找不到這部電影，請換一個關鍵字試試看。"
 
     movie = movies[0]
-    return format_movie(movie, "電影查詢結果")
+    return format_single_movie(movie, "電影查詢結果")
 
-def get_reason(movie):
-    overview = movie.get("overview") or ""
 
-    if "恐怖" in overview or "驚悚" in overview:
-        return "推薦理由：適合想看緊張、刺激劇情的時候。"
-    elif "愛" in overview or "戀" in overview:
-        return "推薦理由：適合想看情感線或浪漫故事的時候。"
-    elif "冒險" in overview:
-        return "推薦理由：適合想看節奏明快、有探索感的故事。"
-    else:
-        return "推薦理由：這部電影近期關注度不低，可以當作片單參考。"
+def format_movie_list(movies, title):
+    result = f"{title} 🎬\n\n"
 
-def format_movie(movie, title):
+    for i, movie in enumerate(movies, start=1):
+        name = movie.get("title", "無片名")
+        rating = movie.get("vote_average", "無評分")
+        date = movie.get("release_date", "無上映日期")
+        overview = movie.get("overview") or "目前沒有中文簡介。"
+
+        if len(overview) > 45:
+            overview = overview[:45] + "……"
+
+        result += (
+            f"{i}. 《{name}》\n"
+            f"評分：{rating}｜上映：{date}\n"
+            f"簡介：{overview}\n\n"
+        )
+
+    result += "如果沒有喜歡的，可以輸入「換一批」。\n\n"
+    result += "資料來源：TMDb"
+    return result
+
+
+def format_single_movie(movie, title):
     name = movie.get("title", "無片名")
     rating = movie.get("vote_average", "無評分")
     date = movie.get("release_date", "無上映日期")
@@ -181,14 +314,11 @@ def format_movie(movie, title):
     if len(overview) > 120:
         overview = overview[:120] + "……"
 
-    reason = get_reason(movie)
-
     return (
-        f"{title}\n\n"
+        f"{title} 🎬\n\n"
         f"片名：《{name}》\n"
         f"評分：{rating}\n"
         f"上映日期：{date}\n"
         f"簡介：{overview}\n\n"
-        f"{reason}\n\n"
         f"資料來源：TMDb"
     )
